@@ -34,12 +34,12 @@ func GetClientByPasswd(username, host string, port int, passwd string) (*sshclie
 func NewTerminal(server *config.Server, sshUser *config.SSHUser, sess *ssh.Session) error {
 	upstreamClient, err := NewSSHClient(server, sshUser)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	upstreamSess, err := upstreamClient.NewSession()
 	if err != nil {
-		return nil
+		return err
 	}
 	defer upstreamSess.Close()
 
@@ -47,22 +47,29 @@ func NewTerminal(server *config.Server, sshUser *config.SSHUser, sess *ssh.Sessi
 	upstreamSess.Stdin = *sess
 	upstreamSess.Stderr = *sess
 
-	pty, winCh, _ := (*sess).Pty()
-
-	if err := upstreamSess.RequestPty(pty.Term, pty.Window.Height, pty.Window.Width, pty.TerminalModes); err != nil {
-		return err
+	// Check if the client session has a PTY
+	pty, winCh, isPty := (*sess).Pty()
+	
+	if isPty {
+		// Request PTY for the upstream session
+		if err := upstreamSess.RequestPty(pty.Term, pty.Window.Height, pty.Window.Width, pty.TerminalModes); err != nil {
+			return err
+		}
+		
+		// Handle window size changes
+		go func() {
+			for win := range winCh {
+				upstreamSess.WindowChange(win.Height, win.Width)
+			}
+		}()
 	}
 
+	// Start the shell
 	if err := upstreamSess.Shell(); err != nil {
 		return err
 	}
-	
-	go func () {
-		for win := range winCh {
-			upstreamSess.WindowChange(win.Height, win.Width)
-		}
-	}()
 
+	// Wait for the session to complete
 	if err := upstreamSess.Wait(); err != nil {
 		return err
 	}

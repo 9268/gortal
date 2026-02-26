@@ -3,9 +3,11 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"time"
 	"encoding/base64"
+	"strings"
 
 	"github.com/TNK-Studio/gortal/config"
 	"github.com/TNK-Studio/gortal/core/jump"
@@ -13,6 +15,7 @@ import (
 	"github.com/TNK-Studio/gortal/utils"
 	"github.com/TNK-Studio/gortal/utils/logger"
 	"github.com/elfgzp/ssh"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 var (
@@ -73,6 +76,26 @@ func sessionHandler(sess *ssh.Session) {
 	case "scp":
 		sshd.ExecuteSCP(args, sess)
 	default:
+		// Check if this is a direct login command (server:sshUser format)
+		// First check if the command itself is a direct login format
+		if cmd != "" && strings.Contains(cmd, ":") {
+			// The command itself might be server:sshUser format
+			if directLoginHandler(sess, []string{cmd}) {
+				return
+			}
+		}
+		// Then check if any argument is a direct login format
+		if len(args) > 0 {
+			// Try to parse direct login format
+			if directLoginHandler(sess, args) {
+				return
+			}
+		}
+		// If no direct login command found, check if we should show help
+		if cmd == "help" || cmd == "-h" || cmd == "--help" {
+			showDirectLoginHelp(sess)
+			return
+		}
 		sshHandler(sess)
 	}
 }
@@ -82,8 +105,154 @@ func sshHandler(sess *ssh.Session) {
 	jps.Run(sess)
 }
 
+// showDirectLoginHelp shows help information for direct login
+func showDirectLoginHelp(sess *ssh.Session) {
+	helpMsg := `
+Direct Login Help:
+==================
+
+Format: server:sshUser
+
+Examples:
+  - production-server:root
+  - staging-server:ubuntu
+  - web-server:deploy
+
+To see available servers and SSH users, use the interactive menu.
+To use direct login, specify the server name and SSH user name separated by colon.
+
+Note: You must have permission to access the specified server and SSH user.
+`
+	sshd.Info(helpMsg, sess)
+}
+
 func scpHandler(args []string, sess *ssh.Session) {
 	sshd.ExecuteSCP(args, sess)
+}
+
+// directLoginHandler handles direct login commands in format: server:sshUser
+// Returns true if it was a direct login command, false otherwise
+func directLoginHandler(sess *ssh.Session, args []string) bool {
+	// Check if the first argument matches server:sshUser format
+	if len(args) < 1 {
+		return false
+	}
+
+	arg := args[0]
+	
+	// Check for help command
+	if arg == "help" || arg == "-h" || arg == "--help" {
+		showDirectLoginHelp(sess)
+		return true
+	}
+	
+	// Check if it contains colon (server:sshUser format)
+	if !strings.Contains(arg, ":") {
+		return false
+	}
+
+	parts := strings.SplitN(arg, ":", 2)
+	if len(parts) != 2 {
+		return false
+	}
+
+	serverName := strings.TrimSpace(parts[0])
+	sshUserName := strings.TrimSpace(parts[1])
+	
+	// Validate that both parts are non-empty
+	if serverName == "" || sshUserName == "" {
+		return false
+	}
+
+	// Read config
+	config.Conf.ReadFrom(*config.ConfPath)
+
+	// Get current user
+	currentUser := (*sess).User()
+	user := config.Conf.GetUserByUsername(currentUser)
+	if user == nil {
+		sshd.ErrorInfo(fmt.Errorf("User '%s' not found in configuration", currentUser), sess)
+		return true
+	}
+
+	// Find server by name
+	server := config.Conf.GetServerByName(serverName)
+	if server == nil {
+		sshd.ErrorInfo(fmt.Errorf("Server '%s' not found. Available servers: %v", serverName, getAvailableServerNames()), sess)
+		return true
+	}
+
+	// Check if user has access to this server
+	userServers := config.Conf.GetUserServers(user)
+	serverKey := ""
+	for key, s := range userServers {
+		if s == server {
+			serverKey = key
+			break
+		}
+	}
+	if serverKey == "" {
+		sshd.ErrorInfo(fmt.Errorf("User '%s' does not have access to server '%s'", currentUser, serverName), sess)
+		return true
+	}
+
+	// Find SSH user for this server
+	sshUsers := config.Conf.GetServerSSHUsers(user, server)
+	var sshUser *config.SSHUser
+	var sshUserKey string
+	for key, su := range sshUsers {
+		if su.SSHUsername == sshUserName {
+			sshUser = su
+			sshUserKey = key
+			break
+		}
+	}
+	if sshUser == nil {
+		availableUsers := make([]string, 0)
+		for _, su := range sshUsers {
+			availableUsers = append(availableUsers, su.SSHUsername)
+		}
+		sshd.ErrorInfo(fmt.Errorf("SSH user '%s' not found for server '%s'. Available users: %v", sshUserName, serverName, availableUsers), sess)
+		return true
+	}
+
+	// Validate identity file exists
+	if !utils.FileExited(sshUser.IdentityFile) {
+		sshd.ErrorInfo(fmt.Errorf("Identity file '%s' not found for SSH user '%s'", sshUser.IdentityFile, sshUserName), sess)
+		return true
+	}
+
+	// Log direct login attempt
+	logger.Logger.Infof("Direct login: user '%s' -> server '%s' (key: %s) -> SSH user '%s' (key: %s)", 
+		currentUser, serverName, serverKey, sshUserName, sshUserKey)
+
+	// Check if the session has a PTY
+	_, _, isPty := (*sess).Pty()
+	if !isPty {
+		sshd.ErrorInfo(fmt.Errorf("Direct login requires a PTY. Please use an interactive SSH session."), sess)
+		return true
+	}
+
+	// Establish direct SSH connection
+	err := sshd.NewTerminal(server, sshUser, sess)
+	if err != nil {
+		sshd.ErrorInfo(fmt.Errorf("Failed to connect to target server: %v", err), sess)
+		return true
+	}
+
+	return true
+}
+
+// getAvailableServerNames returns list of available server names for error messages
+func getAvailableServerNames() []string {
+	names := make([]string, 0)
+	if config.Conf.Servers == nil {
+		return names
+	}
+	for _, server := range *config.Conf.Servers {
+		names = append(names, server.Name)
+	}
+	return names
 }
 
 func main() {
@@ -103,12 +272,73 @@ func main() {
 	})
 
 	log.Printf("starting ssh server on port %d...\n", *Port)
-	log.Fatal(ssh.ListenAndServe(
-		fmt.Sprintf(":%d", *Port),
-		nil,
-		ssh.PasswordAuth(passwordAuth),
-		ssh.PublicKeyAuth(publickKeyAuth),
-		ssh.HostKeyFile(utils.FilePath(*hostKeyFile)),
-	),
-	)
+	
+	// Create server with modern encryption algorithms
+	server := &ssh.Server{
+		Addr: fmt.Sprintf(":%d", *Port),
+		Version: "Gortal-1.0",
+		PasswordHandler: func(ctx ssh.Context, password string) bool {
+			return passwordAuth(ctx, password)
+		},
+		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
+			return publickKeyAuth(ctx, key)
+		},
+		ServerConfigCallback: func(ctx ssh.Context) *gossh.ServerConfig {
+			config := &gossh.ServerConfig{}
+			
+			// Add host key
+			keyBytes, err := ioutil.ReadFile(utils.FilePath(*hostKeyFile))
+			if err != nil {
+				logger.Logger.Error("Failed to read host key: %v", err)
+				return config
+			}
+			key, err := gossh.ParsePrivateKey(keyBytes)
+			if err != nil {
+				logger.Logger.Error("Failed to parse host key: %v", err)
+				return config
+			}
+			config.AddHostKey(key)
+			
+			// Configure modern encryption algorithms
+			// Include both modern and legacy algorithms for compatibility
+			config.KeyExchanges = []string{
+				"curve25519-sha256",
+				"curve25519-sha256@libssh.org",
+				"ecdh-sha2-nistp256",
+				"ecdh-sha2-nistp384",
+				"ecdh-sha2-nistp521",
+				"diffie-hellman-group16-sha512",
+				"diffie-hellman-group14-sha256",
+				"diffie-hellman-group-exchange-sha256",
+				"diffie-hellman-group-exchange-sha1",
+				"diffie-hellman-group14-sha1",
+			}
+			
+			config.Ciphers = []string{
+				"aes256-gcm@openssh.com",
+				"chacha20-poly1305@openssh.com",
+				"aes128-gcm@openssh.com",
+				"aes256-ctr",
+				"aes192-ctr",
+				"aes128-ctr",
+				"aes256-cbc",
+				"aes192-cbc",
+				"aes128-cbc",
+				"3des-cbc",
+			}
+			
+			config.MACs = []string{
+				"hmac-sha2-512-etm@openssh.com",
+				"hmac-sha2-256-etm@openssh.com",
+				"hmac-sha2-512",
+				"hmac-sha2-256",
+				"hmac-sha1",
+				"hmac-sha1-96",
+			}
+			
+			return config
+		},
+	}
+	
+	log.Fatal(server.ListenAndServe())
 }
