@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"time"
 	"encoding/base64"
@@ -15,7 +14,6 @@ import (
 	"github.com/TNK-Studio/gortal/utils"
 	"github.com/TNK-Studio/gortal/utils/logger"
 	"github.com/elfgzp/ssh"
-	gossh "golang.org/x/crypto/ssh"
 )
 
 var (
@@ -272,73 +270,12 @@ func main() {
 	})
 
 	log.Printf("starting ssh server on port %d...\n", *Port)
-	
-	// Create server with modern encryption algorithms
-	server := &ssh.Server{
-		Addr: fmt.Sprintf(":%d", *Port),
-		Version: "Gortal-1.0",
-		PasswordHandler: func(ctx ssh.Context, password string) bool {
-			return passwordAuth(ctx, password)
-		},
-		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
-			return publickKeyAuth(ctx, key)
-		},
-		ServerConfigCallback: func(ctx ssh.Context) *gossh.ServerConfig {
-			config := &gossh.ServerConfig{}
-			
-			// Add host key
-			keyBytes, err := ioutil.ReadFile(utils.FilePath(*hostKeyFile))
-			if err != nil {
-				logger.Logger.Error("Failed to read host key: %v", err)
-				return config
-			}
-			key, err := gossh.ParsePrivateKey(keyBytes)
-			if err != nil {
-				logger.Logger.Error("Failed to parse host key: %v", err)
-				return config
-			}
-			config.AddHostKey(key)
-			
-			// Configure modern encryption algorithms
-			// Include both modern and legacy algorithms for compatibility
-			config.KeyExchanges = []string{
-				"curve25519-sha256",
-				"curve25519-sha256@libssh.org",
-				"ecdh-sha2-nistp256",
-				"ecdh-sha2-nistp384",
-				"ecdh-sha2-nistp521",
-				"diffie-hellman-group16-sha512",
-				"diffie-hellman-group14-sha256",
-				"diffie-hellman-group-exchange-sha256",
-				"diffie-hellman-group-exchange-sha1",
-				"diffie-hellman-group14-sha1",
-			}
-			
-			config.Ciphers = []string{
-				"aes256-gcm@openssh.com",
-				"chacha20-poly1305@openssh.com",
-				"aes128-gcm@openssh.com",
-				"aes256-ctr",
-				"aes192-ctr",
-				"aes128-ctr",
-				"aes256-cbc",
-				"aes192-cbc",
-				"aes128-cbc",
-				"3des-cbc",
-			}
-			
-			config.MACs = []string{
-				"hmac-sha2-512-etm@openssh.com",
-				"hmac-sha2-256-etm@openssh.com",
-				"hmac-sha2-512",
-				"hmac-sha2-256",
-				"hmac-sha1",
-				"hmac-sha1-96",
-			}
-			
-			return config
-		},
-	}
-	
-	log.Fatal(server.ListenAndServe())
+	log.Fatal(ssh.ListenAndServe(
+		fmt.Sprintf(":%d", *Port),
+		nil,
+		ssh.PasswordAuth(passwordAuth),
+		ssh.PublicKeyAuth(publickKeyAuth),
+		ssh.HostKeyFile(utils.FilePath(*hostKeyFile)),
+	),
+	)
 }
